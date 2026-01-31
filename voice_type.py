@@ -4,6 +4,7 @@
 import argparse
 import io
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,9 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
+
+PID_FILE = Path(tempfile.gettempdir()) / "voice-type.pid"
+AUDIO_FILE = Path(tempfile.gettempdir()) / "voice-type.wav"
 
 
 def get_api_key() -> str:
@@ -65,24 +69,22 @@ def record_audio(duration: float | None = None, sample_rate: int = 16000) -> np.
     return np.concatenate(recording, axis=0)
 
 
-def record_while_key_held(sample_rate: int = 16000) -> np.ndarray:
-    """Record audio while waiting for stdin signal (for hold-to-record)."""
+def record_until_signal(sample_rate: int = 16000) -> np.ndarray:
+    """Record audio until SIGUSR1 is received."""
     recording = []
     stop_flag = threading.Event()
+
+    def handle_signal(signum, frame):
+        stop_flag.set()
+
+    signal.signal(signal.SIGUSR1, handle_signal)
 
     def callback(indata, frames, time_info, status):
         if status:
             print(f"Status: {status}", file=sys.stderr)
         recording.append(indata.copy())
 
-    def wait_for_signal():
-        # Read a single byte from stdin to signal stop
-        sys.stdin.read(1)
-        stop_flag.set()
-
     with sd.InputStream(samplerate=sample_rate, channels=1, dtype=np.float32, callback=callback):
-        thread = threading.Thread(target=wait_for_signal, daemon=True)
-        thread.start()
         while not stop_flag.is_set():
             time.sleep(0.05)
 
@@ -157,30 +159,58 @@ def cmd_type(args: argparse.Namespace) -> None:
         notify("No speech detected", urgency="low")
 
 
-def cmd_hold(args: argparse.Namespace) -> None:
-    """Hold-to-record mode for keybinding integration."""
-    # This mode expects a signal on stdin when key is released
-    audio = record_while_key_held()
-    text = transcribe(audio)
-    if text:
-        type_text(text)
+def cmd_toggle(args: argparse.Namespace) -> None:
+    """Toggle recording - press once to start, again to stop and transcribe."""
+    # Check if already recording
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            # Send signal to stop recording
+            os.kill(pid, signal.SIGUSR1)
+            notify("Stopping...", urgency="low")
+            return
+        except (ProcessLookupError, ValueError):
+            # Process died, clean up
+            PID_FILE.unlink(missing_ok=True)
+
+    # Start recording
+    PID_FILE.write_text(str(os.getpid()))
+    try:
+        notify("Recording... (press again to stop)", urgency="low")
+        audio = record_until_signal()
+
+        if len(audio) < 1600:  # Less than 0.1s at 16kHz
+            notify("Recording too short", urgency="low")
+            return
+
+        notify("Transcribing...", urgency="low")
+        text = transcribe(audio)
+
+        if text:
+            type_text(text)
+            notify(f"{text[:50]}", urgency="low")
+        else:
+            notify("No speech detected", urgency="low")
+    finally:
+        PID_FILE.unlink(missing_ok=True)
 
 
 def cmd_quick(args: argparse.Namespace) -> None:
-    """Quick record with visual feedback - designed for keybindings."""
-    notify("🎤 Recording...", urgency="low")
-    audio = record_audio(duration=args.duration if args.duration else None)
+    """Quick record with fixed duration - designed for simple keybindings."""
+    duration = args.duration if args.duration else 5.0  # Default 5 seconds
+    notify(f"Recording for {duration}s...", urgency="low")
+    audio = record_audio(duration=duration)
 
     if len(audio) < 1600:  # Less than 0.1s at 16kHz
         notify("Recording too short", urgency="low")
         return
 
-    notify("⏳ Transcribing...", urgency="low")
+    notify("Transcribing...", urgency="low")
     text = transcribe(audio)
 
     if text:
         type_text(text)
-        notify(f"✓ {text[:50]}", urgency="low")
+        notify(f"{text[:50]}", urgency="low")
     else:
         notify("No speech detected", urgency="low")
 
@@ -199,14 +229,14 @@ def main() -> None:
     type_parser.add_argument("-d", "--duration", type=float, help="Recording duration in seconds")
     type_parser.set_defaults(func=cmd_type)
 
-    # quick command - optimized for keybindings
-    quick_parser = subparsers.add_parser("quick", help="Quick mode for keybindings")
-    quick_parser.add_argument("-d", "--duration", type=float, help="Recording duration in seconds")
-    quick_parser.set_defaults(func=cmd_quick)
+    # toggle command - press once to start, again to stop (best for keybindings)
+    toggle_parser = subparsers.add_parser("toggle", help="Toggle: press to start, press again to stop")
+    toggle_parser.set_defaults(func=cmd_toggle)
 
-    # hold command - hold-to-record for advanced keybinding
-    hold_parser = subparsers.add_parser("hold", help="Hold-to-record mode")
-    hold_parser.set_defaults(func=cmd_hold)
+    # quick command - fixed duration recording
+    quick_parser = subparsers.add_parser("quick", help="Record for fixed duration (default 5s)")
+    quick_parser.add_argument("-d", "--duration", type=float, help="Recording duration in seconds (default: 5)")
+    quick_parser.set_defaults(func=cmd_quick)
 
     args = parser.parse_args()
     args.func(args)
