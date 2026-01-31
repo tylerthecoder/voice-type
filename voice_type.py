@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -19,13 +20,29 @@ from openai import OpenAI
 
 PID_FILE = Path(tempfile.gettempdir()) / "voice-type.pid"
 AUDIO_FILE = Path(tempfile.gettempdir()) / "voice-type.wav"
+LOG_FILE = Path.home() / ".voice-type.log"
+
+
+def log(msg: str) -> None:
+    """Log message to file."""
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{datetime.now().isoformat()}] {msg}\n")
 
 
 def get_api_key() -> str:
-    """Get OpenAI API key from environment or shell_gpt config."""
+    """Get OpenAI API key from environment or config files."""
     key = os.environ.get("OPENAI_API_KEY")
     if key:
         return key
+
+    # Try owl secrets
+    secrets_file = Path.home() / "owl" / "setups" / "secrets" / "secrets.sh"
+    if secrets_file.exists():
+        for line in secrets_file.read_text().splitlines():
+            if "OPENAI_API_KEY=" in line:
+                # Handle export OPENAI_API_KEY="value" format
+                part = line.split("OPENAI_API_KEY=", 1)[1].strip()
+                return part.strip('"').strip("'")
 
     # Try shell_gpt config
     sgpt_config = Path.home() / ".config" / "shell_gpt" / ".sgptrc"
@@ -34,7 +51,7 @@ def get_api_key() -> str:
             if line.startswith("OPENAI_API_KEY="):
                 return line.split("=", 1)[1].strip()
 
-    raise ValueError("OPENAI_API_KEY not found in environment or ~/.config/shell_gpt/.sgptrc")
+    raise ValueError("OPENAI_API_KEY not found")
 
 
 def record_audio(duration: float | None = None, sample_rate: int = 16000) -> np.ndarray:
@@ -118,17 +135,33 @@ def transcribe(audio_data: np.ndarray, sample_rate: int = 16000) -> str:
 
 def type_text(text: str) -> None:
     """Type text at cursor position using wtype (Wayland)."""
+    log(f"type_text called with: {text[:50]}")
     if not text:
         return
 
+    # Small delay to let focus settle
+    time.sleep(0.1)
+
+    # Try wtype first
     try:
-        subprocess.run(["wtype", "--", text], check=True)
+        log("running wtype")
+        result = subprocess.run(["wtype", "-d", "10", "--", text], capture_output=True, text=True)
+        log(f"wtype returned {result.returncode}, stderr={result.stderr}")
+        if result.returncode == 0:
+            return
+        # wtype failed, fall back to clipboard
+        notify(f"wtype failed, copied to clipboard", urgency="low")
     except FileNotFoundError:
-        print("Error: wtype not found. Install it with: sudo pacman -S wtype", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"Error typing text: {e}", file=sys.stderr)
-        sys.exit(1)
+        log("wtype not found")
+        notify("wtype not found, copied to clipboard", urgency="low")
+
+    # Fallback: copy to clipboard
+    try:
+        log("falling back to wl-copy")
+        subprocess.run(["wl-copy", "--", text], check=True)
+    except Exception as e:
+        log(f"wl-copy failed: {e}")
+        notify(f"Failed to copy: {e}", urgency="critical")
 
 
 def notify(message: str, urgency: str = "normal") -> None:
@@ -161,38 +194,52 @@ def cmd_type(args: argparse.Namespace) -> None:
 
 def cmd_toggle(args: argparse.Namespace) -> None:
     """Toggle recording - press once to start, again to stop and transcribe."""
+    log("toggle called")
+
     # Check if already recording
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
+            log(f"found existing PID {pid}, sending SIGUSR1")
             # Send signal to stop recording
             os.kill(pid, signal.SIGUSR1)
             notify("Stopping...", urgency="low")
             return
-        except (ProcessLookupError, ValueError):
+        except (ProcessLookupError, ValueError) as e:
+            log(f"PID file exists but process dead: {e}")
             # Process died, clean up
             PID_FILE.unlink(missing_ok=True)
 
     # Start recording
+    log(f"starting recording, PID={os.getpid()}")
     PID_FILE.write_text(str(os.getpid()))
     try:
         notify("Recording... (press again to stop)", urgency="low")
         audio = record_until_signal()
+        log(f"recording stopped, got {len(audio)} samples")
 
         if len(audio) < 1600:  # Less than 0.1s at 16kHz
+            log("recording too short")
             notify("Recording too short", urgency="low")
             return
 
         notify("Transcribing...", urgency="low")
         text = transcribe(audio)
+        log(f"transcribed: {text[:100] if text else '(empty)'}")
 
         if text:
+            log("calling type_text")
             type_text(text)
+            log("type_text returned")
             notify(f"{text[:50]}", urgency="low")
         else:
             notify("No speech detected", urgency="low")
+    except Exception as e:
+        log(f"ERROR: {e}")
+        raise
     finally:
         PID_FILE.unlink(missing_ok=True)
+        log("toggle finished")
 
 
 def cmd_quick(args: argparse.Namespace) -> None:
