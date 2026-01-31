@@ -18,9 +18,13 @@ import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
 
-PID_FILE = Path(tempfile.gettempdir()) / "voice-type.pid"
-AUDIO_FILE = Path(tempfile.gettempdir()) / "voice-type.wav"
-LOG_FILE = Path.home() / ".voice-type.log"
+XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+STATE_DIR = XDG_STATE_HOME / "voice-type"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+PID_FILE = STATE_DIR / "voice-type.pid"
+AUDIO_FILE = STATE_DIR / "voice-type.wav"
+LOG_FILE = STATE_DIR / "voice-type.log"
 
 
 def log(msg: str) -> None:
